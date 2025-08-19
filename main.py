@@ -10,6 +10,13 @@ from semantic_kernel.functions import kernel_function
 from semantic_kernel.connectors.ai.function_choice_behavior import FunctionChoiceBehavior
 from semantic_kernel.contents.chat_history import ChatHistory
 
+# Import custom agent support
+from custom_agent_client import (
+    CustomAgentClient, 
+    CustomAgentConfig, 
+    CustomAgentConfigLoader
+)
+
 # Load environment variables
 load_dotenv()
 
@@ -20,6 +27,79 @@ class AgentResponse:
     agent_name: str
     favorite_color: str
     message: str
+
+class CustomCloudAgent:
+    """Wrapper for custom deployed agents that integrates with the Agent 2 Agent workflow"""
+    
+    def __init__(self, config: CustomAgentConfig):
+        self.config = config
+        self.cloud_platform = config.platform
+        self.agent_name = config.name
+        self.favorite_color = config.favorite_color
+    
+    async def process_task(self, task: str) -> AgentResponse:
+        """Process a task using the custom deployed agent"""
+        
+        try:
+            async with CustomAgentClient(self.config) as client:
+                # Create a comprehensive prompt for the custom agent
+                enhanced_task = f"""
+                You are {self.agent_name}, an AI agent deployed on {self.cloud_platform} cloud platform.
+                Your favorite color from the rainbow is {self.favorite_color}.
+                
+                Task: {task}
+                
+                Please respond as {self.agent_name} and make sure to mention:
+                1. Your cloud platform ({self.cloud_platform})
+                2. Your name ({self.agent_name})
+                3. Your favorite color ({self.favorite_color})
+                4. Complete the given task using your specific expertise
+                
+                Keep your response concise and in character. Focus on how your {self.cloud_platform} deployment 
+                capabilities contribute to solving this task.
+                """
+                
+                custom_response = await client.send_message(enhanced_task)
+                
+                if custom_response.success:
+                    return AgentResponse(
+                        cloud_platform=self.cloud_platform,
+                        agent_name=self.agent_name,
+                        favorite_color=self.favorite_color,
+                        message=custom_response.message
+                    )
+                else:
+                    # Fallback message if custom agent fails
+                    fallback_message = f"""
+                    I am {self.agent_name}, a custom AI agent deployed on {self.cloud_platform}. 
+                    My favorite color is {self.favorite_color}. Unfortunately, I'm currently experiencing 
+                    connectivity issues, but I would contribute my {self.cloud_platform}-specific expertise 
+                    to help with: {task}
+                    
+                    Error: {custom_response.error_message}
+                    """
+                    
+                    return AgentResponse(
+                        cloud_platform=self.cloud_platform,
+                        agent_name=self.agent_name,
+                        favorite_color=self.favorite_color,
+                        message=fallback_message
+                    )
+        
+        except Exception as e:
+            # Handle any unexpected errors
+            error_message = f"""
+            I am {self.agent_name}, a custom AI agent on {self.cloud_platform}. 
+            My favorite color is {self.favorite_color}. I encountered an unexpected error 
+            while processing the task: {str(e)}
+            """
+            
+            return AgentResponse(
+                cloud_platform=self.cloud_platform,
+                agent_name=self.agent_name,
+                favorite_color=self.favorite_color,
+                message=error_message
+            )
 
 class CloudAgent:
     """Base class for cloud platform agents implementing Agent 2 Agent protocol"""
@@ -113,20 +193,32 @@ class Agent2AgentWorkflow:
         
         return kernel
     
-    def _create_agents(self) -> List[CloudAgent]:
-        """Create agents for different cloud platforms with unique names and colors"""
-        rainbow_colors = ["Red", "Orange", "Yellow", "Green", "Blue", "Indigo", "Violet"]
+    def _create_agents(self) -> List:
+        """Create agents from configuration file - no hardcoded agents"""
+        agents = []
         
-        agents = [
-            CloudAgent(self.kernel, "AWS", "Alexandra", rainbow_colors[0]),
-            CloudAgent(self.kernel, "Azure", "Benjamin", rainbow_colors[1]), 
-            CloudAgent(self.kernel, "GCP", "Catherine", rainbow_colors[2]),
-            CloudAgent(self.kernel, "AWS", "David", rainbow_colors[3]),
-            CloudAgent(self.kernel, "Azure", "Elena", rainbow_colors[4]),
-            CloudAgent(self.kernel, "GCP", "Francis", rainbow_colors[5]),
-            CloudAgent(self.kernel, "Multi-Cloud", "Gabriel", rainbow_colors[6])
-        ]
+        # Load agent configuration
+        use_custom = CustomAgentConfigLoader.should_use_custom_agents()
         
+        if use_custom:
+            print("🔧 Loading agents from configuration...")
+            agent_configs = CustomAgentConfigLoader.load_custom_agents()
+            
+            for config in agent_configs:
+                if config.agent_type == "custom":
+                    # Create custom HTTP agent
+                    agents.append(CustomCloudAgent(config))
+                    auth_status = "🔐 Authenticated" if config.is_authenticated else "🔓 Unauthenticated"
+                    print(f"   ✅ Added custom agent: {config.name} ({config.platform}) - {config.favorite_color} - {auth_status}")
+                elif config.agent_type == "builtin":
+                    # Create built-in SK agent
+                    agents.append(CloudAgent(self.kernel, config.platform, config.name, config.favorite_color))
+                    print(f"   ✅ Added built-in agent: {config.name} ({config.platform}) - {config.favorite_color}")
+        
+        if len(agents) == 0:
+            print("⚠️  No agents configured. Please check your custom_agents.env file and set USE_CUSTOM_AGENTS=true")
+        
+        print(f"📊 Total agents in workflow: {len(agents)}")
         return agents
     
     async def execute_workflow(self, main_task: str) -> List[AgentResponse]:
@@ -138,7 +230,13 @@ class Agent2AgentWorkflow:
         
         # Phase 1: Task delegation to each agent sequentially
         for i, agent in enumerate(self.agents, 1):
-            print(f"\n📋 Step {i}: Delegating to {agent.agent_name} on {agent.cloud_platform}")
+            if isinstance(agent, CustomCloudAgent):
+                auth_status = "🔐 Auth" if agent.config.is_authenticated else "🔓 No Auth"
+                agent_type = f"Custom ({auth_status})"
+            else:
+                agent_type = "Built-in SK"
+            
+            print(f"\n📋 Step {i}: Delegating to {agent.agent_name} ({agent_type}) on {agent.cloud_platform}")
             
             # Create specific sub-task for each agent
             sub_task = f"""
@@ -146,6 +244,7 @@ class Agent2AgentWorkflow:
             1. Introduce yourself with your cloud platform and favorite color
             2. Contribute to this main task: {main_task}
             3. Prepare a handoff message for the next agent in the workflow
+            4. Mention your specific deployment capabilities on {agent.cloud_platform}
             """
             
             try:
@@ -154,11 +253,21 @@ class Agent2AgentWorkflow:
                 self.workflow_history.append(response)
                 
                 print(f"✅ {agent.agent_name} ({agent.cloud_platform}) completed their task")
+                print(f"   Agent Type: {agent_type}")
                 print(f"   Favorite Color: {agent.favorite_color}")
                 print(f"   Response: {response.message[:100]}...")
                 
             except Exception as e:
                 print(f"❌ Error with {agent.agent_name}: {str(e)}")
+                
+                # Create error response to maintain workflow continuity
+                error_response = AgentResponse(
+                    cloud_platform=agent.cloud_platform,
+                    agent_name=agent.agent_name,
+                    favorite_color=agent.favorite_color,
+                    message=f"Agent {agent.agent_name} encountered an error: {str(e)}"
+                )
+                all_responses.append(error_response)
                 continue
         
         # Phase 2: Workflow aggregation
@@ -172,11 +281,25 @@ class Agent2AgentWorkflow:
         report += "\n🌈 FINAL AGENT 2 AGENT WORKFLOW REPORT"
         report += "\n" + "=" * 60
         
+        # Count agent types
+        custom_count = sum(1 for agent in self.agents if isinstance(agent, CustomCloudAgent))
+        builtin_count = len(self.agents) - custom_count
+        
         report += f"\n\n📊 Total Agents Participated: {len(responses)}"
+        report += f"\n   🔧 Custom Deployed Agents: {custom_count}"
+        report += f"\n   🤖 Built-in SK Agents: {builtin_count}"
         report += "\n\n🌟 Agent Summary:"
         
         for i, response in enumerate(responses, 1):
-            report += f"\n\n{i}. Agent: {response.agent_name}"
+            # Determine agent type
+            agent = next((a for a in self.agents if a.agent_name == response.agent_name), None)
+            if isinstance(agent, CustomCloudAgent):
+                auth_status = " - 🔐 Authenticated" if agent.config.is_authenticated else " - 🔓 Unauthenticated"
+                agent_type = f"Custom{auth_status}"
+            else:
+                agent_type = "Built-in SK"
+            
+            report += f"\n\n{i}. Agent: {response.agent_name} ({agent_type})"
             report += f"\n   Cloud Platform: {response.cloud_platform}"
             report += f"\n   Favorite Color: {response.favorite_color}"
             report += f"\n   Message: {response.message}"
@@ -191,8 +314,10 @@ class Agent2AgentWorkflow:
         report += "\n\n☁️ Cloud Platform Summary:"
         for cloud, agents in cloud_summary.items():
             report += f"\n\n{cloud}:"
-            for agent in agents:
-                report += f"\n  - {agent.agent_name} (Color: {agent.favorite_color})"
+            for agent_response in agents:
+                agent = next((a for a in self.agents if a.agent_name == agent_response.agent_name), None)
+                agent_type = "Custom" if isinstance(agent, CustomCloudAgent) else "Built-in"
+                report += f"\n  - {agent_response.agent_name} ({agent_type}) - Color: {agent_response.favorite_color}"
         
         return report
 
